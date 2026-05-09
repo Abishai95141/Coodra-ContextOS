@@ -1,0 +1,214 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: lint + typecheck + unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        # Version is read from `packageManager` in package.json (pinned to pnpm@10.33.0).
+        # Do NOT add `with: version:` — pnpm/action-setup@v5 rejects the run with
+        # "Multiple versions of pnpm specified" when both sources are set.
+        uses: pnpm/action-setup@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Print toolchain versions
+        run: |
+          node --version
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Approve build scripts
+        # `pnpm install --frozen-lockfile` is lenient about unbuilt native deps,
+        # but some workspaces (better-sqlite3, esbuild) need their postinstall
+        # scripts run for typecheck / tests to work. `pnpm rebuild` re-runs
+        # them against the already-resolved versions.
+        run: pnpm rebuild
+
+      - name: Migration lock (hand-written preserve-blocks in drizzle/*.sql)
+        # Runs BEFORE lint so a drift in an architecturally-locked block
+        # (e.g. drizzle-kit regenerated 0001 and wiped the vec0 virtual
+        # table) surfaces before any other signal. Produces a diffable
+        # failure naming file, marker, expected sha256, and remediation
+        # command (see packages/db/scripts/check-migration-lock.mjs).
+        run: pnpm --filter @coodra/contextos-db run check:migration-lock
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test:unit
+
+  integration:
+    name: postgres migrations (integration)
+    runs-on: ubuntu-latest
+    needs: verify
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: contextos
+          POSTGRES_PASSWORD: contextos_ci_password
+          POSTGRES_DB: contextos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U contextos -d contextos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://contextos:contextos_ci_password@127.0.0.1:5432/contextos
+      REDIS_URL: redis://127.0.0.1:6379/0
+      CONTEXTOS_MODE: team
+      # Solo-bypass sentinel: keeps `config/env.ts` `superRefine` happy
+      # under CONTEXTOS_MODE=team without supplying real Clerk creds.
+      # The sentinel is recognised by `auth.ts` and routes auth into
+      # the bypass path. Real keys are loaded from a local `.env` (gitignored).
+      # Required so test files that import `config/env.ts` (S16's
+      # `transports/http.test.ts`) can trigger the module's eager parse.
+      CLERK_SECRET_KEY: sk_test_replace_me
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        # Version is read from `packageManager` in package.json (pinned to pnpm@10.33.0).
+        # Do NOT add `with: version:` — pnpm/action-setup@v5 rejects the run with
+        # "Multiple versions of pnpm specified" when both sources are set.
+        uses: pnpm/action-setup@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Approve build scripts
+        run: pnpm rebuild
+
+      - name: Build @coodra/contextos-* in dependency order
+        # `shared` first (db + policy depend on it transitively); `db`
+        # next (its dist/migrate.js is consumed by both apps' auto-migrate
+        # at boot); `policy` next (apps consume it); `mcp-server` and
+        # `hooks-bridge` last because their integration tests may spawn
+        # `dist/index.js` as a subprocess. Without the explicit build,
+        # `node dist/index.js` fails with ENOENT and the SDK Client / HTTP
+        # client times out with "Connection closed".
+        run: |
+          pnpm --filter @coodra/contextos-shared build
+          pnpm --filter @coodra/contextos-db build
+          pnpm --filter @coodra/contextos-policy build
+          pnpm --filter @coodra/contextos-mcp-server build
+          pnpm --filter @coodra/contextos-hooks-bridge build
+
+      - name: Integration tests (Postgres migrations + hooks-bridge auth chain + mcp-server boot)
+        run: pnpm test:integration
+
+  hook-adapter-smoke:
+    name: hook-adapter shell scripts (windsurf + cursor)
+    runs-on: ${{ matrix.os }}
+    needs: verify
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run hook-adapter smoke test
+        # Spawns a Python mock bridge, pipes fixture payloads into
+        # each adapter, asserts exit codes (0 / 2 / 0-fail-open).
+        # Only requires bash + curl + python3 — no Node, no pnpm.
+        run: bash scripts/hook-adapters/__tests__/smoke.sh
+
+  e2e:
+    name: end-to-end (manifest + transport + idempotency + full session)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [verify, integration]
+    env:
+      CONTEXTOS_MODE: solo
+      CLERK_SECRET_KEY: sk_test_replace_me
+      LOG_LEVEL: error
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Approve build scripts
+        run: pnpm rebuild
+
+      - name: Build @coodra/contextos-* in dependency order (required by e2e imports)
+        # All packages have `main: ./dist/index.js` and `exports`
+        # pointing into dist. The e2e tests import them as
+        # workspace:* deps; without the build, vitest can't resolve
+        # the entry points. Module 03 S14 will spawn hooks-bridge as
+        # a subprocess for the full-session lifecycle test, so include
+        # its dist here too — keeps each slice self-contained.
+        run: |
+          pnpm --filter @coodra/contextos-shared build
+          pnpm --filter @coodra/contextos-db build
+          pnpm --filter @coodra/contextos-policy build
+          pnpm --filter @coodra/contextos-mcp-server build
+          pnpm --filter @coodra/contextos-hooks-bridge build
+
+      # `testcontainers` needs a Docker daemon. GitHub-hosted ubuntu
+      # runners ship Docker pre-installed; just verify it before the
+      # tests pull pgvector/pgvector:pg16.
+      - name: Verify Docker daemon
+        run: docker info
+
+      - name: E2E tests (5 scenarios, 24 tests; testcontainers + subprocess)
+        run: pnpm test:e2e
